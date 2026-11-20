@@ -1,0 +1,17 @@
+#lets the toolbox be installed with "uv pip install -e ." so "import analyze_dbs" works from any folder or notebook
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "analyze_dbs"
+version = "0.1.0"
+description = "Walker lab toolbox for measuring and analyzing post-processed DBS evoked responses (ERNA)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pandas"]
+
+[project.optional-dependencies]
+dev = ["pytest"] #only needed to run the tests
+
+[tool.setuptools]
+packages = ["analyze_dbs"]
