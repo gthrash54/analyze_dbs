@@ -65,7 +65,7 @@ def erna_rms(signal, fs):
     Input:
     signal: one post-processed channel (1-D), artifact peak at sample 98
     fs: sampling freq in Hz
-    Returns: one number, in the signal's units (volts from postprocess_dbs; Sarah's tables are in mV)
+    Returns: one number, in the signal's units (volts from preprocess_dbs; Sarah's tables are in mV)
     """
     _, filtered_signal = filtered_erna_window(signal,fs) # the times aren't needed here
     rms = np.sqrt(np.mean(filtered_signal**2))
