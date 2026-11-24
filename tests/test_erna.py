@@ -4,7 +4,8 @@ import pytest
 FS = 48828.125
 from scipy.signal import butter, filtfilt
 
-from analyze_dbs.erna import erna_rms, filtered_erna_window, find_extrema, lowpass_600, time_axis_ms
+from analyze_dbs.erna import (erna_rms, filtered_erna_window, find_extrema, lowpass_600, time_axis_ms,
+                              truncate_extrema)
 
 N = 2295 #a full stage 1 post-processed waveform at 48.8 kHz
 
@@ -251,6 +252,15 @@ def test_rms_stage2_axis_measures_the_same_window():
 
 #find_extrema
 
+def ramp_with(n, spikes):
+    """A gently rising line, n samples long, with single-sample spikes at the given positions ({position: value}).
+    The slope is there so nothing is flat: find_extrema refuses flat tops and flat bottoms."""
+    signal = np.linspace(0, 0.001, n)
+    for position, value in spikes.items():
+        signal[position] = value
+    return signal
+
+
 def test_extrema_of_a_decaying_sine_alternate_in_time_order():
     times = time_axis_ms(N, FS)
     window_times, filtered = filtered_erna_window(decaying_sine(times), times, FS)
@@ -288,32 +298,27 @@ def test_extrema_a_trough_above_zero_is_still_a_trough():
 
 def test_extrema_81_apart_loses_the_smaller_peak_82_keeps_both():
     #Sarah's MinPeakDistance=81 keeps peaks MORE than 81 samples apart
-    filtered = np.zeros(400)
-    filtered[100], filtered[181] = 5, 3 #exactly 81 apart
+    filtered = ramp_with(400, {100: 5, 181: 3}) #exactly 81 apart
     _, values, kinds = find_extrema(np.arange(400.0), filtered, FS)
     assert list(values[kinds == "peak"]) == [5] #the taller one stays
-    filtered = np.zeros(400)
-    filtered[100], filtered[182] = 5, 3 #82 apart
+    filtered = ramp_with(400, {100: 5, 182: 3}) #82 apart
     _, values, kinds = find_extrema(np.arange(400.0), filtered, FS)
     assert list(values[kinds == "peak"]) == [5, 3]
 
 
 def test_extrema_distance_follows_fs():
     #at 25 kHz the distance is round(25000/600) = 42 samples: 42 apart loses one, 43 keeps both
-    filtered = np.zeros(300)
-    filtered[100], filtered[142] = 5, 3
+    filtered = ramp_with(300, {100: 5, 142: 3})
     _, values, kinds = find_extrema(np.arange(300.0), filtered, 25000)
     assert list(values[kinds == "peak"]) == [5]
-    filtered = np.zeros(300)
-    filtered[100], filtered[143] = 5, 3
+    filtered = ramp_with(300, {100: 5, 143: 3})
     _, values, kinds = find_extrema(np.arange(300.0), filtered, 25000)
     assert list(values[kinds == "peak"]) == [5, 3]
 
 
 def test_extrema_a_peak_and_a_trough_can_be_close():
     #the distance rule is within peaks and within troughs, not between a peak and a trough
-    filtered = np.zeros(400)
-    filtered[100], filtered[110] = 5, -4
+    filtered = ramp_with(400, {100: 5, 110: -4})
     ext_times, _, ext_kinds = find_extrema(np.arange(400.0), filtered, FS)
     assert list(ext_times) == [100, 110]
     assert list(ext_kinds) == ["peak", "trough"]
@@ -328,18 +333,149 @@ def test_extrema_none_found_gives_three_empty_arrays():
 
 def test_extrema_distance_rounds_a_half_up_like_matlab():
     #25500/600 = 42.5: MATLAB's round gives 43, so peaks have to be more than 43 apart (Python's round would give 42)
-    filtered = np.zeros(300)
-    filtered[100], filtered[143] = 5, 3 #43 apart: one goes
+    filtered = ramp_with(300, {100: 5, 143: 3}) #43 apart: one goes
     _, values, kinds = find_extrema(np.arange(300.0), filtered, 25500)
     assert list(values[kinds == "peak"]) == [5]
-    filtered = np.zeros(300)
-    filtered[100], filtered[144] = 5, 3 #44 apart: both stay
+    filtered = ramp_with(300, {100: 5, 144: 3}) #44 apart: both stay
     _, values, kinds = find_extrema(np.arange(300.0), filtered, 25500)
     assert list(values[kinds == "peak"]) == [5, 3]
 
 
 def test_extrema_troughs_81_apart_lose_the_shallower_one():
-    filtered = np.zeros(400)
-    filtered[100], filtered[181] = -5, -3
+    filtered = ramp_with(400, {100: -5, 181: -3})
     _, values, kinds = find_extrema(np.arange(400.0), filtered, FS)
     assert list(values[kinds == "trough"]) == [-5]
+
+
+def test_extrema_refuses_a_flat_topped_peak():
+    #scipy would say position 4 (the middle), MATLAB position 3 (the left edge)
+    filtered = np.array([0, 2, 0, 3, 3, 3, 0, 1, 0.5])
+    with pytest.raises(ValueError, match="peak with a flat top at sample 4"):
+        find_extrema(np.arange(9.0), filtered, FS)
+
+
+def test_extrema_refuses_a_flat_bottomed_trough():
+    filtered = -np.array([0, 2, 0, 3, 3, 3, 0, 1, 0.5])
+    with pytest.raises(ValueError, match="trough with a flat bottom"):
+        find_extrema(np.arange(9.0), filtered, FS)
+
+
+def test_extrema_a_flat_signal_is_not_refused():
+    #all zeros has no top or bottom at all (a flat stretch touching the ends is never a peak): no extrema, no error
+    ext_times, _, _ = find_extrema(np.arange(100.0), np.zeros(100), FS)
+    assert len(ext_times) == 0
+
+
+#truncate_extrema
+
+def extrema(times, kinds):
+    """Hand-made extrema for the truncation tests: the times, made-up values (+1 for a peak, -1 for a trough) and the
+    kinds, written "p" or "t" for short."""
+    kinds = np.array(["peak" if k == "p" else "trough" for k in kinds], dtype=str)
+    values = np.where(kinds == "peak", 1.0, -1.0)
+    return np.array(times, dtype=float), values, kinds
+
+
+def test_truncate_keeps_a_clean_oscillation_whole():
+    times, values, kinds = extrema([4, 6, 8, 10, 12], "ptptp")
+    kept_times, kept_values, kept_kinds = truncate_extrema(times, values, kinds)
+    assert np.array_equal(kept_times, times)
+    assert np.array_equal(kept_values, values)
+    assert np.array_equal(kept_kinds, kinds)
+
+
+def test_truncate_a_trough_first_is_fine():
+    #her rule is about taking turns, not about which kind starts
+    kept_times, _, kept_kinds = truncate_extrema(*extrema([4, 6, 8], "tpt"))
+    assert list(kept_times) == [4, 6, 8]
+    assert list(kept_kinds) == ["trough", "peak", "trough"]
+
+
+def test_truncate_fewer_than_two_extrema_keeps_nothing():
+    for times, kinds in (([], ""), ([4], "p")):
+        kept_times, kept_values, kept_kinds = truncate_extrema(*extrema(times, kinds))
+        assert len(kept_times) == 0 and len(kept_values) == 0 and len(kept_kinds) == 0
+
+
+def test_truncate_a_late_first_extremum_keeps_nothing():
+    kept_times, kept_values, kept_kinds = truncate_extrema(*extrema([7.01, 9, 11], "ptp"))
+    assert len(kept_times) == 0 and len(kept_values) == 0 and len(kept_kinds) == 0
+    #exactly 7 ms is still in time (her test is "> 7")
+    kept_times, _, _ = truncate_extrema(*extrema([7.0, 9, 11], "ptp"))
+    assert list(kept_times) == [7, 9, 11]
+
+
+def test_truncate_cuts_at_two_of_a_kind_in_a_row():
+    #the second peak in a row (at 10) is the first bad one: it and everything after go, even though 12 and 14 behave
+    kept_times, kept_values, kept_kinds = truncate_extrema(*extrema([4, 6, 8, 10, 12, 14], "ptpptp"))
+    assert list(kept_times) == [4, 6, 8]
+    assert list(kept_values) == [1, -1, 1]
+    assert list(kept_kinds) == ["peak", "trough", "peak"]
+
+
+def test_truncate_cuts_at_a_gap_over_3p3_ms():
+    #3.4 ms from 8 to 11.4: the one at 11.4 is the first bad one
+    kept_times, _, kept_kinds = truncate_extrema(*extrema([4, 6, 8, 11.4, 13], "ptptp"))
+    assert list(kept_times) == [4, 6, 8]
+    assert list(kept_kinds) == ["peak", "trough", "peak"]
+
+
+def test_truncate_a_gap_of_exactly_3p3_ms_is_kept():
+    times, values, kinds = extrema([4.0, 7.3, 9.0], "ptp")
+    assert times[1] - times[0] == 3.3 #the test only means something if this is exact
+    kept_times, _, _ = truncate_extrema(times, values, kinds)
+    assert list(kept_times) == [4.0, 7.3, 9.0]
+
+
+def test_truncate_a_break_at_the_second_extremum_leaves_one():
+    #the first extremum always survives rule 2
+    kept_times, _, kept_kinds = truncate_extrema(*extrema([4, 6, 8], "ppt"))
+    assert list(kept_times) == [4]
+    assert list(kept_kinds) == ["peak"]
+
+
+def test_truncate_uses_the_first_break_only():
+    #a gap break at 12.5, then a kind break later: the cut is at the earlier one
+    kept_times, _, _ = truncate_extrema(*extrema([4, 6, 8, 12.5, 14, 15], "ptptpp"))
+    assert list(kept_times) == [4, 6, 8]
+
+
+def test_truncate_custom_limits():
+    times, values, kinds = extrema([4, 6, 8, 10], "ptpt")
+    assert len(truncate_extrema(times, values, kinds, first_max_ms=3.9)[0]) == 0
+    assert list(truncate_extrema(times, values, kinds, max_gap_ms=1.0)[0]) == [4]
+    assert list(truncate_extrema(times, values, kinds, max_gap_ms=2.0)[0]) == [4, 6, 8, 10]
+
+
+def test_truncate_after_find_extrema_on_a_decaying_sine():
+    times = time_axis_ms(N, FS)
+    window_times, filtered = filtered_erna_window(decaying_sine(times), times, FS)
+    found = find_extrema(window_times, filtered, FS)
+    kept_times, kept_values, kept_kinds = truncate_extrema(*found)
+    #300 Hz: first peak at 4.14 ms, 1.67 ms between extrema, strictly taking turns, so all 10 stay
+    assert len(kept_times) == 10
+    assert np.array_equal(kept_times, found[0])
+
+
+def test_truncate_exactly_two_extrema():
+    #a good pair stays whole
+    assert list(truncate_extrema(*extrema([4, 6], "pt"))[0]) == [4, 6]
+    #a bad second one leaves the first (there is no second "fewer than 2" check after the cut, as in her code)
+    assert list(truncate_extrema(*extrema([4, 6], "pp"))[0]) == [4]
+    assert list(truncate_extrema(*extrema([4, 8], "pt"))[0]) == [4]
+
+
+def test_truncate_a_3p3_ms_gap_survives_rounding_error():
+    #66 samples at 20 kHz is 3.3 ms, but 8.3 - 5.0 comes out a hair above 3.3 in floating point
+    times, values, kinds = extrema([5.0, 8.3, 10.0], "ptp")
+    assert times[1] - times[0] > 3.3
+    assert list(truncate_extrema(times, values, kinds)[0]) == [5.0, 8.3, 10.0]
+    #a real 3.4 ms gap is still cut
+    assert list(truncate_extrema(*extrema([5.0, 8.4, 10.0], "ptp"))[0]) == [5.0]
+
+
+def test_truncate_accepts_plain_lists():
+    #two peaks in a row must still be caught when the kinds arrive as a list, not an array
+    kept_times, kept_values, kept_kinds = truncate_extrema([4, 6, 8], [1, 1, -1], ["peak", "peak", "trough"])
+    assert list(kept_times) == [4]
+    assert list(kept_kinds) == ["peak"]

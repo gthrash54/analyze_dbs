@@ -135,13 +135,17 @@ def find_extrema(times, filtered, fs):
     peaks and to troughs separately: a peak and a trough can be any distance apart.
     Nothing else filters them (no height or prominence), so small wiggles count. Sarah's later rules (alternation,
     gaps, the first extremum by 7 ms) do the weeding.
-    Not yet matched to MATLAB, two things:
+    Two differences from MATLAB:
     - The detector. On a flat-topped peak scipy picks the middle sample and MATLAB the leftmost, and when two
-      equally tall peaks are too close MATLAB keeps the earlier one while scipy doesn't promise which. A
-      matlab_findpeaks port is planned; until then this is scipy's answer.
+      equally tall peaks are too close MATLAB keeps the earlier one while scipy doesn't promise which. Both need
+      neighbouring or competing samples to be exactly equal, which should be very rare in a low-pass filtered
+      signal, so no MATLAB-style peak finder was written (decided 2026-11-24). Instead this function refuses any
+      signal with a flat-topped peak or flat-bottomed trough. Two separate, exactly equal peaks closer than the
+      minimum distance are NOT caught; only the comparison with her outputs would show one.
     - The times. These are the true sample times. Sarah rebuilds each time from the frame number with her rounded fs
       and rounds it to 0.01 ms (M:589-594), so an extremum at 7.004 ms here is 7.00 in her table. That matters for
-      her "first extremum after 7 ms" and "gap over 3.3 ms" rules; how to handle it is still to be decided.
+      her "first extremum after 7 ms" and "gap over 3.3 ms" rules. Decided 2026-11-23: keep the true sample times
+      and let the comparison with her outputs name the rows her rounding explains (on the list for Walker).
     Input:
     times: the time of each sample in ms, e.g. the first output of filtered_erna_window
     filtered: the 600 Hz low-passed signal over the same samples (1-D), e.g. its second output
@@ -150,7 +154,15 @@ def find_extrema(times, filtered, fs):
     - the times in ms
     - the values, in the signal's units (troughs keep their real sign, usually negative)
     - the kinds, "peak" or "trough"
+    Raises ValueError if any peak has a flat top or any trough a flat bottom (two or more exactly equal samples).
     """
+    #fail loudly: scipy would put a flat-topped peak at its middle and MATLAB at its left edge. plateau_size=2 asks
+    #scipy for only the peaks whose top is 2 or more samples wide; a real filtered signal has none
+    for flipped, what in ((filtered, "peak with a flat top"), (-filtered, "trough with a flat bottom")):
+        flat_positions, _ = find_peaks(flipped, plateau_size=2)
+        if len(flat_positions) > 0:
+            raise ValueError(f"the signal has a {what} at sample {flat_positions[0]} ({times[flat_positions[0]]:.3f} "
+                             f"ms): scipy and MATLAB can place it differently, so it isn't measured")
     #Sarah's MinPeakDistance is round(fs/600) = 81 samples; +1 because scipy's rule is "at least", MATLAB's "more than".
     #floor(x + 0.5) rounds an exact half up, as MATLAB's round does (Python's round would send 42.5 to 42)
     min_distance = int(np.floor(fs/600 + 0.5))+1
@@ -167,3 +179,45 @@ def find_extrema(times, filtered, fs):
     time_order = np.argsort(all_times, kind="stable")
     extrema_times, extrema_values, extrema_kinds = all_times[time_order], all_values[time_order], all_kinds[time_order]
     return extrema_times, extrema_values, extrema_kinds
+
+
+def truncate_extrema(times, values, kinds, max_gap_ms=3.3, first_max_ms=7.0):
+    """
+    Keeps only the extrema Sarah counts as the ERNA (M:601-617), from find_extrema's time-ordered list.
+    Two rules, in her order:
+    1. No ERNA at all if there are fewer than 2 extrema, or the first one comes after 7 ms (first_max_ms). Nothing is
+       kept. An extremum at exactly 7 ms is still in time.
+    2. Otherwise walk down the list and stop at the first extremum that is the same kind as the one before it (two
+       peaks or two troughs in a row), or more than 3.3 ms after it (max_gap_ms; her comment calls this 150 Hz).
+       That one and everything after it are dropped, even if later ones behave again. A gap of exactly 3.3 ms is
+       still fine.
+    Both limits get a sliver of leeway (a billionth of a ms), so a time that sits exactly on a limit isn't pushed
+    over it by rounding error in the subtraction (8.3 - 5.0 comes out as 3.3000000000000007).
+    The first extremum is never dropped by rule 2, so the result can be a single extremum.
+    One difference from Sarah: these are the true sample times. She applies both rules to times rebuilt with her
+    rounded fs and rounded to 0.01 ms, so an extremum at 7.004 ms passes her rule 1 and fails here (see find_extrema;
+    on the list for Walker).
+    Input:
+    times: the extrema times in ms, in time order
+    values: their values
+    kinds: "peak" or "trough" for each
+    max_gap_ms: the longest allowed time between one extremum and the next
+    first_max_ms: the latest the first extremum may come
+    Returns: the times, values and kinds that are kept, as arrays (the front of each input, possibly all of it or
+    none of it). They share memory with the inputs when those are arrays; they are not copies.
+    """
+    #plain lists would compare as two whole lists below (one True or False for everything), so make them arrays
+    times, values, kinds = np.asarray(times), np.asarray(values), np.asarray(kinds)
+    leeway_ms = 1e-9 #far below one sample; only there to absorb rounding error at an exact limit
+    #rule 1. The length is checked first, so an empty list never reaches times[0]
+    if len(times) < 2 or times[0] > first_max_ms + leeway_ms:
+        return times[:0], values[:0], kinds[:0]
+    #rule 2. True where an extremum is a different kind from the one BEFORE it and within max_gap_ms of it. One slot
+    #shorter than the inputs: slot 0 is about extremum 1
+    follows_rules_mask = (kinds[1:] != kinds[:-1]) & (np.diff(times) <= max_gap_ms + leeway_ms)
+    breaks = np.flatnonzero(~follows_rules_mask) #the slots where a rule is broken
+    if len(breaks) == 0: #nothing breaks the rules: keep them all
+        return times, values, kinds
+    #slot 0 of the mask is about extremum 1, so a break at slot b means extremum b+1 is the bad one: keep 0..b
+    n_keep = breaks[0] + 1
+    return times[:n_keep], values[:n_keep], kinds[:n_keep]
