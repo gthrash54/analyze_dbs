@@ -8,7 +8,7 @@ name = "analyze_dbs"
 version = "0.1.0"
 description = "Walker lab toolbox for measuring and analyzing post-processed DBS evoked responses (ERNA)"
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy", "pandas"]
+dependencies = ["numpy>=2.0", "scipy", "pandas"] #numpy 2 for np.concat
 
 [project.optional-dependencies]
 dev = ["pytest"] #only needed to run the tests
