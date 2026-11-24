@@ -221,3 +221,70 @@ def truncate_extrema(times, values, kinds, max_gap_ms=3.3, first_max_ms=7.0):
     #slot 0 of the mask is about extremum 1, so a break at slot b means extremum b+1 is the bad one: keep 0..b
     n_keep = breaks[0] + 1
     return times[:n_keep], values[:n_keep], kinds[:n_keep]
+
+
+def _fixed_slots(numbers, n_slots):
+    """
+    Puts numbers into a box of exactly n_slots slots: the first n_slots of them if there are more, blanks (NaN) after
+    them if there are fewer. An array can't grow, so the box is made full-size first and the numbers copied into its
+    front. Returns the box (a new array; numbers isn't changed).
+    """
+    box = np.full(n_slots, np.nan)
+    n_stored = min(n_slots, len(numbers)) #how many fit: all of them, or n_slots if there are more
+    box[:n_stored] = numbers[:n_stored]
+    return box
+
+
+def wave_parameters(times, values, max_peaks=8):
+    """
+    Sarah's wave measures from the extrema truncate_extrema kept (M:620-634).
+    - Latencies: the time of every other extremum, starting with the first. So they are peak times if a peak came
+      first and trough times if a trough did (open question Q5).
+    - Amplitudes: the size of the swing from each of those extrema to the next one (1st to 2nd, 3rd to 4th, ...).
+    - Inter-peak intervals: the time from each latency to the next, so one full cycle each.
+    - Number of peaks: how many latencies there are.
+    - Average frequency: 1000 / the mean interval, in Hz. NaN when there are fewer than 2 latencies. Sarah rounds it
+      to a whole Hz; this doesn't. Against her tables expect up to 0.5 Hz from that rounding, and sometimes a little
+      more because her intervals come from times rounded to 0.01 ms (e.g. a true 299.56 Hz is 299 in her table).
+    - Duration: the time of the last latency, counted from time 0, not from the first latency (Q5).
+    The number of peaks, the frequency and the duration use EVERY latency (every odd-numbered kept extremum; a
+    trailing even one affects none of them). Only what is stored is capped.
+    No extrema at all (truncate_extrema kept nothing) is not an error: 0 peaks and everything else NaN.
+    Sarah stores 4 latencies, 4 amplitudes and 3 intervals; this stores max_peaks, max_peaks and max_peaks - 1, with
+    max_peaks 8 by default (Garrett, 2026-11-24; on the list for Walker).
+    The first 4 latencies, 4 amplitudes and 3 intervals are the ones she stores, so comparisons with her tables use
+    those. Most waveforms have fewer than 8, so slots 5-8 are usually blank: never drop a row because they are (Q8).
+    Input:
+    times: the kept extrema times in ms, in time order, e.g. the first output of truncate_extrema
+    values: their values, e.g. its second output
+    max_peaks: how many latencies and amplitudes to store (and one fewer intervals). At least 1
+    Returns, in this order:
+    - latencies: exactly max_peaks slots, in ms, NaN where there was no extremum
+    - amplitudes: exactly max_peaks slots, in the values' units, NaN where there was none
+    - inter-peak intervals: exactly max_peaks - 1 slots, in ms, NaN where there was none
+    - number of peaks
+    - average frequency in Hz
+    - duration in ms
+    Raises ValueError if max_peaks is below 1.
+    """
+    if max_peaks < 1:
+        raise ValueError(f"max_peaks is {max_peaks}; it has to be at least 1")
+    all_latencies = times[::2] #every other extremum from the first ([::2]: the 3rd number is the step)
+    all_amplitudes = np.abs(np.diff(values))[::2] #every swing between neighbours, then every other one
+    all_intervals = np.diff(all_latencies) #time between one latency and the next
+    #these use ALL the latencies, not the stored ones: the stored arrays have blanks and a fixed length
+    n_peaks = len(all_latencies)
+    #with 0 or 1 latency there are no intervals to average: say NaN directly, so np.mean isn't asked to average nothing
+    if len(all_intervals) == 0:
+        average_frequency = np.nan
+    else: average_frequency = 1000/np.mean(all_intervals) # Hz from mean interval in ms
+    #what gets stored: fixed-length arrays, blank (NaN) where there was nothing. One fewer interval than latencies
+    latencies = _fixed_slots(all_latencies, max_peaks)
+    amplitudes = _fixed_slots(all_amplitudes, max_peaks)
+    inter_peak_intervals = _fixed_slots(all_intervals, max_peaks - 1)
+    #the last latency, read from the full list (the stored box usually ends in blanks). NaN if there are no latencies
+    if len(all_latencies) == 0:
+        duration = np.nan
+    else: duration = all_latencies[-1]
+    
+    return latencies, amplitudes, inter_peak_intervals, n_peaks, average_frequency, duration

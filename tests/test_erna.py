@@ -4,8 +4,8 @@ import pytest
 FS = 48828.125
 from scipy.signal import butter, filtfilt
 
-from analyze_dbs.erna import (erna_rms, filtered_erna_window, find_extrema, lowpass_600, time_axis_ms,
-                              truncate_extrema)
+from analyze_dbs.erna import (_fixed_slots, erna_rms, filtered_erna_window, find_extrema, lowpass_600,
+                              time_axis_ms, truncate_extrema, wave_parameters)
 
 N = 2295 #a full stage 1 post-processed waveform at 48.8 kHz
 
@@ -479,3 +479,156 @@ def test_truncate_accepts_plain_lists():
     kept_times, kept_values, kept_kinds = truncate_extrema([4, 6, 8], [1, 1, -1], ["peak", "peak", "trough"])
     assert list(kept_times) == [4]
     assert list(kept_kinds) == ["peak"]
+
+
+#_fixed_slots and wave_parameters
+
+def test_fixed_slots_pads_cuts_and_fits():
+    assert np.array_equal(_fixed_slots(np.array([1.0, 2.0]), 4), [1, 2, np.nan, np.nan], equal_nan=True) #too few
+    assert np.array_equal(_fixed_slots(np.array([1.0, 2.0, 3.0]), 2), [1, 2]) #too many: the first ones
+    assert np.array_equal(_fixed_slots(np.array([1.0, 2.0]), 2), [1, 2]) #just right
+    assert np.array_equal(_fixed_slots(np.array([]), 3), [np.nan]*3, equal_nan=True) #nothing: all blank
+
+
+def test_fixed_slots_leaves_its_input_alone():
+    numbers = np.array([1.0, 2.0, 3.0])
+    box = _fixed_slots(numbers, 2)
+    box[0] = 99
+    assert list(numbers) == [1, 2, 3]
+
+
+def test_wave_parameters_by_hand():
+    #peak, trough, peak, trough, peak, trough: latencies are the 1st, 3rd and 5th
+    times = np.array([4.0, 5.5, 7.0, 8.5, 10.5, 12.0])
+    values = np.array([3.0, -2.0, 2.0, -1.0, 1.0, -0.5])
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(times, values)
+    blank = np.nan
+    assert np.array_equal(latencies, [4.0, 7.0, 10.5, blank, blank, blank, blank, blank], equal_nan=True)
+    #swings 1st to 2nd, 3rd to 4th, 5th to 6th
+    assert np.array_equal(amplitudes, [5.0, 3.0, 1.5, blank, blank, blank, blank, blank], equal_nan=True)
+    assert np.array_equal(intervals, [3.0, 3.5, blank, blank, blank, blank, blank], equal_nan=True)
+    assert n_peaks == 3
+    assert frequency == pytest.approx(1000/3.25) #the mean interval is 3.25 ms
+    assert duration == 10.5 #the last latency, from time 0
+
+
+def test_wave_parameters_trough_first_measures_the_troughs():
+    #Sarah's "peak" latencies are whatever kind comes first (Q5)
+    times = np.array([4.0, 5.5, 7.0])
+    values = np.array([-2.0, 3.0, -1.0])
+    latencies, amplitudes, _, n_peaks, _, _ = wave_parameters(times, values, max_peaks=2)
+    assert list(latencies) == [4.0, 7.0]
+    assert np.array_equal(amplitudes, [5.0, np.nan], equal_nan=True)
+    assert n_peaks == 2
+
+
+def test_wave_parameters_odd_count_has_one_fewer_amplitude():
+    #5 extrema: 3 latencies but only 2 complete swings
+    times = np.array([4.0, 5.0, 6.0, 7.0, 8.0])
+    values = np.array([1.0, -1.0, 1.0, -1.0, 1.0])
+    latencies, amplitudes, intervals, n_peaks, _, _ = wave_parameters(times, values, max_peaks=3)
+    assert list(latencies) == [4, 6, 8]
+    assert np.array_equal(amplitudes, [2, 2, np.nan], equal_nan=True)
+    assert list(intervals) == [2, 2]
+    assert n_peaks == 3
+
+
+def test_wave_parameters_the_cap_changes_what_is_stored_not_what_is_measured():
+    times = np.arange(4.0, 16.0) #12 extrema, 1 ms apart: 6 latencies, 2 ms apart
+    values = np.tile([1.0, -1.0], 6)
+    for cap in (4, 8):
+        latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(times, values, max_peaks=cap)
+        assert len(latencies) == cap and len(amplitudes) == cap and len(intervals) == cap - 1
+        assert n_peaks == 6 #all of them, whatever the cap
+        assert frequency == pytest.approx(500)
+        assert duration == 14.0 #the 6th latency, even when only 4 are stored
+    #with 4, the stored ones are the first 4: the same numbers Sarah keeps
+    latencies, _, intervals, _, _, _ = wave_parameters(times, values, max_peaks=4)
+    assert list(latencies) == [4, 6, 8, 10]
+    assert list(intervals) == [2, 2, 2]
+
+
+def test_wave_parameters_default_stores_8():
+    latencies, amplitudes, intervals, _, _, _ = wave_parameters(np.array([4.0, 5.0]), np.array([1.0, -1.0]))
+    assert len(latencies) == 8 and len(amplitudes) == 8 and len(intervals) == 7
+
+
+def test_wave_parameters_empty_input_is_all_missing_without_warnings(recwarn):
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(np.array([]), np.array([]))
+    assert np.all(np.isnan(latencies)) and len(latencies) == 8
+    assert np.all(np.isnan(amplitudes)) and len(amplitudes) == 8
+    assert np.all(np.isnan(intervals)) and len(intervals) == 7
+    assert n_peaks == 0
+    assert np.isnan(frequency) and np.isnan(duration)
+    assert len(recwarn) == 0 #no "mean of empty slice"
+
+
+def test_wave_parameters_one_extremum_has_a_latency_and_duration_but_no_frequency(recwarn):
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(np.array([4.5]), np.array([2.0]))
+    assert latencies[0] == 4.5 and np.all(np.isnan(latencies[1:]))
+    assert np.all(np.isnan(amplitudes)) and np.all(np.isnan(intervals))
+    assert n_peaks == 1
+    assert np.isnan(frequency)
+    assert duration == 4.5
+    assert len(recwarn) == 0
+
+
+def test_wave_parameters_on_a_decaying_300_hz_sine():
+    times = time_axis_ms(N, FS)
+    window_times, filtered = filtered_erna_window(decaying_sine(times), times, FS)
+    kept_times, kept_values, _ = truncate_extrema(*find_extrema(window_times, filtered, FS))
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(kept_times, kept_values)
+    assert n_peaks == 5
+    assert np.allclose(latencies[:5], [4.14, 7.48, 10.79, 14.13, 17.47], atol=0.01)
+    assert np.all(np.isnan(latencies[5:]))
+    assert np.all(np.diff(amplitudes[:5]) < 0) #each swing smaller than the last
+    #the first swing, worked out separately: the first peak's height plus the first trough's depth
+    first_peak = filtered[np.argmin(np.abs(window_times - 4.137))]
+    first_trough = filtered[np.argmin(np.abs(window_times - 5.796))]
+    assert first_peak > 0.5 and first_trough < -0.4
+    assert amplitudes[0] == pytest.approx(first_peak - first_trough)
+    assert np.all(np.isnan(amplitudes[5:])) and np.all(np.isnan(intervals[4:]))
+    assert np.allclose(intervals[:4], 1000/300, atol=0.03)
+    assert frequency == pytest.approx(300, abs=0.5)
+    assert duration == latencies[4]
+
+
+def test_wave_parameters_frequency_and_amplitudes_use_everything_past_the_cap():
+    #uneven intervals (2, 2, 2, 4, 4 ms), so a frequency from only the stored ones would come out different
+    times = np.array([4.0, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 19])
+    values = np.array([6.0, -6, 5, -5, 4, -4, 3, -3, 2, -2, 1, -1])
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(times, values, max_peaks=4)
+    assert list(latencies) == [4, 6, 8, 10]
+    assert list(amplitudes) == [12, 10, 8, 6] #the first 4 swings; the 5th and 6th (4 and 2) aren't stored
+    assert list(intervals) == [2, 2, 2]
+    assert n_peaks == 6
+    assert frequency == pytest.approx(1000/2.8) #the mean of all five intervals, not 1000/2
+    assert duration == 18.0
+
+
+def test_wave_parameters_two_extrema():
+    #one latency, one complete swing: an amplitude but no interval and no frequency (as in her code)
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(
+        np.array([4.0, 5.5]), np.array([1.5, -0.5]), max_peaks=2)
+    assert np.array_equal(latencies, [4.0, np.nan], equal_nan=True)
+    assert np.array_equal(amplitudes, [2.0, np.nan], equal_nan=True)
+    assert np.all(np.isnan(intervals)) and len(intervals) == 1
+    assert n_peaks == 1
+    assert np.isnan(frequency)
+    assert duration == 4.0
+
+
+def test_wave_parameters_max_peaks_limits():
+    times, values = np.array([4.0, 5, 6, 7]), np.array([1.0, -1, 1, -1])
+    latencies, amplitudes, intervals, n_peaks, frequency, _ = wave_parameters(times, values, max_peaks=1)
+    assert list(latencies) == [4] and list(amplitudes) == [2] and len(intervals) == 0
+    assert n_peaks == 2 and frequency == pytest.approx(500) #still measured from everything
+    with pytest.raises(ValueError, match="at least 1"):
+        wave_parameters(times, values, max_peaks=0)
+
+
+def test_wave_parameters_accepts_plain_lists():
+    latencies, amplitudes, _, n_peaks, _, _ = wave_parameters([4.0, 5.5, 7.0], [3.0, -2.0, 2.0], max_peaks=2)
+    assert list(latencies) == [4.0, 7.0]
+    assert np.array_equal(amplitudes, [5.0, np.nan], equal_nan=True)
+    assert n_peaks == 2
