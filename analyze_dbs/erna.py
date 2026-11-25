@@ -5,6 +5,15 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 
 
+class UnmeasurableWaveform(ValueError):
+    """
+    Raised when a waveform's own data can't be measured: it doesn't cover the ERNA window, it has a NaN or infinite
+    value inside it, or it has a flat-topped peak. erna_measures turns this into a "reason" in the row and carries on.
+    Any other error means a mistake in the call (wrong shape, mismatched lengths, a broken time axis) or a bug, and
+    still stops the run. It is a kind of ValueError, so code that catches ValueError catches it too.
+    """
+
+
 def time_axis_ms(n_samples, fs, t0_ms=-2.0):
     """
     The time of every sample of a waveform, in ms from time 0 (the artifact peak in stage 1).
@@ -63,10 +72,11 @@ def filtered_erna_window(signal, times, fs, t1=3, t2=20):
     t1, t2: the window's start and end in ms
     Returns: the window's times in ms, and the filtered signal over that window (830 samples each for 3 to 20 ms at
     48.8 kHz)
-    Raises ValueError if signal or times isn't 1-D, if they differ in length, if t1 isn't before t2, if times has a
-    gap, a NaN or a spacing that doesn't match fs, if the waveform doesn't reach both ends of the window (e.g. a
-    burst_1..9 average, which stops before 20 ms), if the window is too short to filter, or if the signal has a NaN
-    or infinite value inside the window.
+    Raises UnmeasurableWaveform (a ValueError) when the waveform's data can't be measured: it is empty, it doesn't
+    cover the window to within one sample at each end (e.g. a burst_1..9 average, which stops before 20 ms), or it
+    has a NaN or infinite value inside the window (one outside the window doesn't matter).
+    Raises a plain ValueError for a mistake in the call: signal or times not 1-D, different lengths, t1 not before
+    t2, a gap, NaN or wrong spacing anywhere in times, or a window too short to filter.
     """
     signal = np.asarray(signal)
     t = np.asarray(times)
@@ -79,7 +89,7 @@ def filtered_erna_window(signal, times, fs, t1=3, t2=20):
     if not t1 < t2:
         raise ValueError(f"the window start ({t1} ms) has to be before its end ({t2} ms)")
     if len(t) == 0:
-        raise ValueError(f"the signal is empty, too short for the {t1} to {t2} ms window")
+        raise UnmeasurableWaveform(f"the signal is empty, too short for the {t1} to {t2} ms window")
     #fail loudly: the filter treats neighbouring samples as one sample period apart. A gap, a NaN or an axis made
     #with another sampling rate would break that silently
     one_sample_ms = 1000/fs
@@ -92,7 +102,8 @@ def filtered_erna_window(signal, times, fs, t1=3, t2=20):
     #the sums can't let a missing edge sample through)
     slack_ms = one_sample_ms * (1 - 1e-6)
     if t[0] >= t1 + slack_ms or t[-1] <= t2 - slack_ms:
-        raise ValueError(f"the signal covers {t[0]:.3f} to {t[-1]:.3f} ms, too short for the {t1} to {t2} ms window")
+        raise UnmeasurableWaveform(f"the signal covers {t[0]:.3f} to {t[-1]:.3f} ms, too short for the {t1} to {t2} "
+                                   f"ms window")
     window = (t1 <= t)  & (t <= t2) # True for the samples from t1 to t2 ms
     #fail loudly: the filter pads each end with 12 samples taken from the signal, so it needs more than 12
     if np.count_nonzero(window) <= 12:
@@ -102,7 +113,7 @@ def filtered_erna_window(signal, times, fs, t1=3, t2=20):
     windowed_signal = signal[window]
     #fail loudly: one NaN would spread through the filter, give a NaN RMS and no peaks at all, which reads as "no ERNA"
     if not np.all(np.isfinite(windowed_signal)):
-        raise ValueError(f"the signal has NaN or infinite values inside the {t1} to {t2} ms window")
+        raise UnmeasurableWaveform(f"the signal has NaN or infinite values inside the {t1} to {t2} ms window")
     filtered_window = lowpass_600(windowed_signal,fs) # cut first, then filter (her order)
     return windowed_time, filtered_window
 
@@ -154,14 +165,15 @@ def find_extrema(times, filtered, fs):
     - the times in ms
     - the values, in the signal's units (troughs keep their real sign, usually negative)
     - the kinds, "peak" or "trough"
-    Raises ValueError if any peak has a flat top or any trough a flat bottom (two or more exactly equal samples).
+    Raises UnmeasurableWaveform (a ValueError) if any peak has a flat top or any trough a flat bottom (two or more
+    exactly equal samples).
     """
     #fail loudly: scipy would put a flat-topped peak at its middle and MATLAB at its left edge. plateau_size=2 asks
     #scipy for only the peaks whose top is 2 or more samples wide; a real filtered signal has none
     for flipped, what in ((filtered, "peak with a flat top"), (-filtered, "trough with a flat bottom")):
         flat_positions, _ = find_peaks(flipped, plateau_size=2)
         if len(flat_positions) > 0:
-            raise ValueError(f"the signal has a {what} at sample {flat_positions[0]} ({times[flat_positions[0]]:.3f} "
+            raise UnmeasurableWaveform(f"the signal has a {what} at sample {flat_positions[0]} ({times[flat_positions[0]]:.3f} "
                              f"ms): scipy and MATLAB can place it differently, so it isn't measured")
     #Sarah's MinPeakDistance is round(fs/600) = 81 samples; +1 because scipy's rule is "at least", MATLAB's "more than".
     #floor(x + 0.5) rounds an exact half up, as MATLAB's round does (Python's round would send 42.5 to 42)
@@ -288,3 +300,64 @@ def wave_parameters(times, values, max_peaks=8):
     else: duration = all_latencies[-1]
     
     return latencies, amplitudes, inter_peak_intervals, n_peaks, average_frequency, duration
+
+
+def erna_measures(signal, times, fs, max_peaks=8):
+    """
+    Every ERNA measure for one post-processed waveform, as one row of a table: Sarah's erna params for one signal
+    (incrementingExperiment_pull_wave_parameters.m:541-643). It runs, in order: filtered_erna_window (3-20 ms,
+    600 Hz low-pass), the RMS of that window, find_extrema, truncate_extrema and wave_parameters.
+    A waveform that can't be measured doesn't stop a cohort run. Its measures are NaN and "reason" says why:
+    - the trace doesn't cover 3 to 20 ms (to within one sample; e.g. burst_1..9), or has a NaN or infinite value
+      inside that window: everything NaN, with filtered_erna_window's message
+    - a flat-topped peak or flat-bottomed trough: the RMS is kept (it was measured first), the peak measures are NaN,
+      with find_extrema's message
+    - no ERNA (fewer than 2 extrema, or the first after 7 ms): measured, so n_peaks is 0 and the RMS is kept, as in
+      Sarah's table; the other peak measures are NaN, with a "no ERNA" reason
+    n_peaks is NaN when the waveform was never measured and 0 when it was measured and had no ERNA.
+    Not given a reason: measures a short ERNA simply doesn't have. One kept extremum has a latency and duration but
+    no amplitude, interval or frequency; two have one amplitude but no interval or frequency (as in Sarah's code).
+    Only UnmeasurableWaveform is caught. A mistake in the call (mismatched lengths, a 2-D array, a broken time
+    axis) or a bug raises a different error and stops the run, so it can't hide as a "reason".
+    Units: the RMS and amplitudes are in the signal's units (volts from preprocess_dbs; Sarah's tables are in mV).
+    Stage 2: pass the epoch's real time axis (it starts at -1 ms, not -2). The measures are the stage 1 ones
+    (3-20 ms, 600 Hz low-pass); Sarah's stage 2 script measured differently, and that profile is still to decide.
+    Every row has the same keys whatever happens, so a list of rows becomes a table with pandas.DataFrame(rows).
+    Input:
+    signal: one post-processed channel (1-D), e.g. a row from preprocess_dbs' postprocess_condition
+    times: the time of each sample in ms from time 0, e.g. time_axis_ms(len(signal), fs) for stage 1
+    fs: sampling freq in Hz
+    max_peaks: how many latencies and amplitudes to store (one fewer intervals). 8 by default; Sarah stores 4 (on
+        the list for Walker; see wave_parameters)
+    Returns: a dict with rms, reason, n_peaks, freq (Hz), duration (ms), then latencies_1..max_peaks (ms),
+    amplitudes_1..max_peaks (signal units) and intervals_1..max_peaks-1 (ms). 28 keys with the default max_peaks.
+    Raises ValueError if max_peaks is below 1 (a mistake in the call, so it isn't turned into a reason).
+    """
+    if max_peaks < 1:
+        raise ValueError(f"max_peaks is {max_peaks}; it has to be at least 1")
+    #every measure starts missing; whatever gets measured below replaces its NaN
+    row = {"rms": np.nan, "reason": "", 'n_peaks':np.nan, 'freq':np.nan, 'duration':np.nan}
+    #the stored arrays start as boxes of NaN too, so a waveform that is never measured still gets every column
+    lats = _fixed_slots(np.array([]), max_peaks)
+    amps = _fixed_slots(np.array([]), max_peaks)
+    ipis = _fixed_slots(np.array([]), max_peaks-1)
+    try:
+        #raises if the trace doesn't cover 3 to 20 ms (or its times are broken): then nothing is measured
+        window_times, window_signal = filtered_erna_window(signal=signal, times=times, fs=fs)
+        #RMS first, so it is kept even if the peak finding below fails
+        row['rms'] = np.sqrt(np.mean(window_signal**2))
+        #find_extrema raises on a flat-topped peak. Its three outputs feed truncate_extrema directly (the *)
+        extrema_times, values, _ = truncate_extrema(*find_extrema(window_times, window_signal, fs))
+        #the arrays replace the NaN boxes; the three single numbers go straight into the row
+        lats, amps, ipis, row['n_peaks'], row['freq'], row['duration'] = wave_parameters(extrema_times, values,
+                                                                                          max_peaks=max_peaks)
+    except UnmeasurableWaveform as err: #only "this waveform can't be measured"; other errors are bugs and must stop
+        row['reason'] = str(err) #the message, as text, for the table
+    #one column per stored value: latencies_1, latencies_2, ... (measured values, or the NaN boxes)
+    for name, array in (("latencies", lats),("amplitudes", amps), ("intervals", ipis)):
+        for k, a in enumerate(array, start=1):
+            row[f"{name}_{k}"] = a
+    #measured but nothing counted as ERNA: nothing raised, so say why the peak measures are missing
+    if row['n_peaks'] == 0:
+        row["reason"] = "no ERNA: fewer than 2 extrema or the first is after 7 ms"
+    return row

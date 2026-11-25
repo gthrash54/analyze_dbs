@@ -4,8 +4,9 @@ import pytest
 FS = 48828.125
 from scipy.signal import butter, filtfilt
 
-from analyze_dbs.erna import (_fixed_slots, erna_rms, filtered_erna_window, find_extrema, lowpass_600,
-                              time_axis_ms, truncate_extrema, wave_parameters)
+import analyze_dbs.erna as erna_module
+from analyze_dbs.erna import (UnmeasurableWaveform, _fixed_slots, erna_measures, erna_rms, filtered_erna_window, find_extrema,
+                              lowpass_600, time_axis_ms, truncate_extrema, wave_parameters)
 
 N = 2295 #a full stage 1 post-processed waveform at 48.8 kHz
 
@@ -109,7 +110,7 @@ def test_window_custom_edges():
 
 
 def test_window_refuses_a_signal_that_stops_early():
-    #like a burst_1..9 average: about 7.6 ms long, so it never reaches 20 ms
+    #like a burst_1..9 average: it ends at about 7.6 ms, so it never reaches 20 ms
     times = time_axis_ms(470, FS)
     with pytest.raises(ValueError, match="too short for the 3 to 20 ms window"):
         filtered_erna_window(np.zeros(470), times, FS)
@@ -632,3 +633,166 @@ def test_wave_parameters_accepts_plain_lists():
     assert list(latencies) == [4.0, 7.0]
     assert np.array_equal(amplitudes, [5.0, np.nan], equal_nan=True)
     assert n_peaks == 2
+
+
+#erna_measures
+
+def measured_columns(max_peaks=8):
+    """The peak columns erna_measures should add, in order."""
+    return ([f"latencies_{k}" for k in range(1, max_peaks + 1)] + [f"amplitudes_{k}" for k in range(1, max_peaks + 1)]
+            + [f"intervals_{k}" for k in range(1, max_peaks)])
+
+
+def test_erna_measures_decaying_sine_matches_the_functions_it_chains():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    row = erna_measures(signal, times, FS)
+    assert list(row) == ["rms", "reason", "n_peaks", "freq", "duration"] + measured_columns()
+    assert row["reason"] == ""
+    assert row["rms"] == pytest.approx(erna_rms(signal, times, FS))
+    #worked out separately, one function at a time
+    window_times, filtered = filtered_erna_window(signal, times, FS)
+    kept_times, kept_values, _ = truncate_extrema(*find_extrema(window_times, filtered, FS))
+    latencies, amplitudes, intervals, n_peaks, frequency, duration = wave_parameters(kept_times, kept_values)
+    assert row["n_peaks"] == n_peaks == 5
+    assert row["freq"] == pytest.approx(frequency) and row["duration"] == pytest.approx(duration)
+    stored = [row[f"latencies_{k}"] for k in range(1, 9)]
+    assert np.array_equal(stored, latencies, equal_nan=True)
+    assert np.array_equal([row[f"amplitudes_{k}"] for k in range(1, 9)], amplitudes, equal_nan=True)
+    assert np.array_equal([row[f"intervals_{k}"] for k in range(1, 8)], intervals, equal_nan=True)
+    assert row["latencies_1"] == pytest.approx(4.14, abs=0.01) and np.isnan(row["latencies_6"])
+
+
+def test_erna_measures_flat_trace_is_measured_with_no_erna():
+    #the plan's test: 0 peaks and RMS 0, with the peak fields missing
+    times = time_axis_ms(N, FS)
+    row = erna_measures(np.zeros(N), times, FS)
+    assert row["rms"] == 0.0
+    assert row["n_peaks"] == 0
+    assert np.isnan(row["freq"]) and np.isnan(row["duration"])
+    assert all(np.isnan(row[c]) for c in measured_columns())
+    assert row["reason"].startswith("no ERNA")
+
+
+def test_erna_measures_short_trace_is_never_measured_and_says_why():
+    #the plan's test: RMS missing, with its reason. n_peaks is missing too (NaN), not 0
+    times = time_axis_ms(470, FS) #ends at about 7.6 ms, like a burst_1..9 average
+    row = erna_measures(np.zeros(470), times, FS)
+    assert np.isnan(row["rms"]) and np.isnan(row["n_peaks"])
+    assert np.isnan(row["freq"]) and np.isnan(row["duration"])
+    assert all(np.isnan(row[c]) for c in measured_columns())
+    assert "too short for the 3 to 20 ms window" in row["reason"]
+    assert len(row) == 28 #the same columns as a measured row
+
+
+def test_erna_measures_flat_top_keeps_the_rms(monkeypatch):
+    #a flat-topped peak makes find_extrema raise; the RMS was measured first and must survive
+    def flat_top(*args, **kwargs):
+        raise UnmeasurableWaveform("the signal has a peak with a flat top at sample 5 (3.113 ms)")
+    monkeypatch.setattr(erna_module, "find_extrema", flat_top)
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    row = erna_measures(signal, times, FS)
+    assert row["rms"] == pytest.approx(erna_rms(signal, times, FS))
+    assert np.isnan(row["n_peaks"])
+    assert all(np.isnan(row[c]) for c in measured_columns())
+    assert "flat top" in row["reason"]
+
+
+def test_erna_measures_late_first_extremum_is_no_erna(monkeypatch):
+    #extrema that start after 7 ms: truncate_extrema keeps nothing, so 0 peaks and the "no ERNA" reason
+    def late(window_times, filtered, fs):
+        return np.array([7.5, 9.0, 10.5]), np.array([1.0, -1.0, 1.0]), np.array(["peak", "trough", "peak"])
+    monkeypatch.setattr(erna_module, "find_extrema", late)
+    times = time_axis_ms(N, FS)
+    row = erna_measures(decaying_sine(times), times, FS)
+    assert row["n_peaks"] == 0
+    assert row["reason"].startswith("no ERNA")
+    assert row["rms"] > 0 #still measured, as in Sarah's table
+
+
+def test_erna_measures_max_peaks_sets_the_columns():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    row4 = erna_measures(signal, times, FS, max_peaks=4)
+    assert list(row4) == ["rms", "reason", "n_peaks", "freq", "duration"] + measured_columns(4)
+    row8 = erna_measures(signal, times, FS)
+    for k in range(1, 5): #the first 4 are the same numbers either way
+        assert row4[f"latencies_{k}"] == row8[f"latencies_{k}"]
+        assert row4[f"amplitudes_{k}"] == row8[f"amplitudes_{k}"]
+    assert row4["n_peaks"] == row8["n_peaks"] == 5 #measured from everything, not just what is stored
+    assert row4["freq"] == row8["freq"] and row4["duration"] == row8["duration"]
+
+
+def test_erna_measures_bad_max_peaks_is_an_error_not_a_reason():
+    times = time_axis_ms(N, FS)
+    with pytest.raises(ValueError, match="at least 1"):
+        erna_measures(decaying_sine(times), times, FS, max_peaks=0)
+
+
+def test_erna_measures_other_errors_still_stop_the_run():
+    #only ValueError becomes a reason: a wrong input type is a bug in the call and must not be hidden
+    times = time_axis_ms(N, FS)
+    with pytest.raises(TypeError):
+        erna_measures(decaying_sine(times), times, "48828")
+
+
+def test_erna_measures_rows_become_a_table():
+    import pandas as pd
+    times = time_axis_ms(N, FS)
+    rows = [erna_measures(decaying_sine(times), times, FS), erna_measures(np.zeros(N), times, FS),
+            erna_measures(np.zeros(470), time_axis_ms(470, FS), FS)]
+    table = pd.DataFrame(rows)
+    assert table.shape == (3, 28)
+    assert list(table["n_peaks"].isna()) == [False, False, True]
+
+
+def test_erna_measures_real_flat_top_goes_through_the_detector(monkeypatch):
+    #a window with a genuine flat-topped peak, so find_extrema itself (not a stand-in) has to refuse it
+    window_times = np.arange(3.0, 20.0, 0.5)
+    window_signal = np.sin(np.arange(len(window_times)) / 2.0)
+    window_signal[5:8] = 2.0 #three equal samples: a flat top
+    monkeypatch.setattr(erna_module, "filtered_erna_window", lambda **kwargs: (window_times, window_signal))
+    row = erna_measures(np.zeros(N), time_axis_ms(N, FS), FS)
+    assert "flat top" in row["reason"]
+    assert row["rms"] == pytest.approx(np.sqrt(np.mean(window_signal**2)))
+    assert np.isnan(row["n_peaks"])
+
+
+def test_erna_measures_single_kept_extremum(monkeypatch):
+    #the 2nd extremum is 5 ms after the 1st (over 3.3 ms), so only the 1st is kept: one latency, no frequency
+    def found(window_times, filtered, fs):
+        return np.array([4.0, 9.0, 10.5]), np.array([1.0, -1.0, 1.0]), np.array(["peak", "trough", "peak"])
+    monkeypatch.setattr(erna_module, "find_extrema", found)
+    times = time_axis_ms(N, FS)
+    row = erna_measures(decaying_sine(times), times, FS)
+    assert row["n_peaks"] == 1
+    assert row["latencies_1"] == 4.0 and row["duration"] == 4.0
+    assert np.isnan(row["freq"]) and np.isnan(row["amplitudes_1"]) and np.isnan(row["intervals_1"])
+    assert row["reason"] == "" #nothing went wrong; a one-peak ERNA just has no frequency
+
+
+def test_erna_measures_a_mistake_in_the_call_is_not_a_reason():
+    #mismatched lengths are the caller's mistake: they must raise, not become a missing row
+    times = time_axis_ms(N, FS)
+    with pytest.raises(ValueError, match="2295 samples but times has 2294"):
+        erna_measures(decaying_sine(times), times[:-1], FS)
+    with pytest.raises(ValueError, match="1-D"):
+        erna_measures(np.zeros((2, N)), times, FS)
+
+
+def test_erna_measures_a_bug_further_down_is_not_a_reason(monkeypatch):
+    #a ValueError from inside the chain (not an UnmeasurableWaveform) means a bug, and must stop the run
+    def broken(*args, **kwargs):
+        raise ValueError("something went wrong inside wave_parameters")
+    monkeypatch.setattr(erna_module, "wave_parameters", broken)
+    times = time_axis_ms(N, FS)
+    with pytest.raises(ValueError, match="something went wrong"):
+        erna_measures(decaying_sine(times), times, FS)
+
+
+def test_unmeasurable_waveform_is_still_a_value_error():
+    #so anything written to catch ValueError keeps working
+    assert issubclass(UnmeasurableWaveform, ValueError)
+    with pytest.raises(UnmeasurableWaveform):
+        filtered_erna_window(np.zeros(470), time_axis_ms(470, FS), FS)
