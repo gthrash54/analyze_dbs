@@ -5,7 +5,7 @@ FS = 48828.125
 from scipy.signal import butter, filtfilt
 
 import analyze_dbs.erna as erna_module
-from analyze_dbs.erna import (UnmeasurableWaveform, _fixed_slots, erna_measures, erna_rms, filtered_erna_window, find_extrema,
+from analyze_dbs.erna import (UnmeasurableWaveform, _fixed_slots, coastline_index, erna_measures, erna_rms, filtered_erna_window, find_extrema,
                               lowpass_600, time_axis_ms, truncate_extrema, wave_parameters)
 
 N = 2295 #a full stage 1 post-processed waveform at 48.8 kHz
@@ -796,3 +796,141 @@ def test_unmeasurable_waveform_is_still_a_value_error():
     assert issubclass(UnmeasurableWaveform, ValueError)
     with pytest.raises(UnmeasurableWaveform):
         filtered_erna_window(np.zeros(470), time_axis_ms(470, FS), FS)
+
+
+#coastline_index
+
+def hand_trace():
+    """1 kHz, 0 to 29 ms, so every sample sits on a whole ms and the windows can be worked out by hand."""
+    times = np.arange(30.0)
+    signal = np.zeros(30)
+    signal[3:8] = [0, 2, 1, 3, 0] #3-7 ms: steps 2, 1, 2, 3 -> sum 8 over 4 steps
+    signal[2] = signal[8] = 5 #just outside the window: a step into or out of it would add 5
+    signal[25] = 10 #just outside the default noise window (25, 29]: it would add a step of 10
+    signal[26:30] = [0, 1, 0, 2] #26-29 ms: steps 1, 1, 2 -> mean 4/3
+    return signal, times
+
+
+def test_coastline_matches_a_hand_calculation_with_a_noise_correction():
+    #the plan's test: 8 - 4 x 4/3 = 8/3
+    signal, times = hand_trace()
+    assert coastline_index(signal, times, t1=3, t2=7, noise_ms=4) == pytest.approx(8/3)
+
+
+def test_coastline_end_ms_moves_the_noise_window():
+    #the plan's test: an end time passed in (her latest time for that subject and condition) is used, not this
+    #signal's own end. (24, 28] holds 25-28 ms: 10, 0, 1, 0 -> steps 10, 1, 1 -> mean 4 -> 8 - 4 x 4 = -8
+    signal, times = hand_trace()
+    assert coastline_index(signal, times, t1=3, t2=7, noise_ms=4, end_ms=28) == pytest.approx(-8)
+    #negative values are kept as they are (her R code clamps them later, not this function)
+
+
+def test_coastline_fewer_than_2_noise_samples_is_nan_without_a_warning(recwarn):
+    signal, times = hand_trace()
+    assert np.isnan(coastline_index(signal, times, t1=3, t2=7, noise_ms=4, end_ms=60)) #no samples at all
+    assert np.isnan(coastline_index(signal, times, t1=3, t2=7, noise_ms=0.5)) #one sample (29 ms)
+    assert len(recwarn) == 0
+
+
+def test_coastline_decaying_sine_and_flat_trace():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    window = signal[(times >= 3) & (times <= 20)]
+    noise = signal[times > times[-1] - 7]
+    expected = np.abs(np.diff(window)).sum() - (len(window) - 1) * np.abs(np.diff(noise)).mean()
+    assert coastline_index(signal, times) == pytest.approx(expected)
+    assert coastline_index(signal, times) == pytest.approx(5.811, abs=0.001)
+    assert coastline_index(np.zeros(N), times) == 0.0
+
+
+def test_coastline_scales_with_the_signal():
+    #twice the signal, twice every step, twice the index
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    assert coastline_index(2 * signal, times) == pytest.approx(2 * coastline_index(signal, times))
+
+
+def test_coastline_uses_the_signal_not_a_filtered_copy():
+    #a fast 5 kHz wiggle inside 3-20 ms would vanish under the 600 Hz low-pass, but the coastline must count it
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    wiggle = np.where((times >= 3) & (times <= 20), 0.01 * np.sin(2 * np.pi * 5000 * times / 1000), 0.0)
+    wiggly = signal + wiggle
+    window = wiggly[(times >= 3) & (times <= 20)]
+    noise = wiggly[times > times[-1] - 7]
+    expected = np.abs(np.diff(window)).sum() - (len(window) - 1) * np.abs(np.diff(noise)).mean()
+    assert coastline_index(wiggly, times) == pytest.approx(expected)
+    assert coastline_index(wiggly, times) > coastline_index(signal, times) + 0.5 #the wiggle adds about 0.75
+
+
+def test_coastline_short_trace_is_unmeasurable():
+    times = time_axis_ms(470, FS) #ends at about 7.6 ms
+    with pytest.raises(UnmeasurableWaveform, match="too short for the 3 to 20 ms coastline window"):
+        coastline_index(np.zeros(470), times)
+
+
+def test_coastline_nan_inside_a_window_is_unmeasurable_but_outside_is_fine():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    in_window = signal.copy()
+    in_window[np.argmin(np.abs(times - 10))] = np.nan
+    with pytest.raises(UnmeasurableWaveform, match="NaN or infinite"):
+        coastline_index(in_window, times)
+    in_noise = signal.copy()
+    in_noise[-1] = np.nan
+    with pytest.raises(UnmeasurableWaveform, match="NaN or infinite"):
+        coastline_index(in_noise, times)
+    between = signal.copy()
+    between[np.argmin(np.abs(times - 30))] = np.nan #30 ms: in neither window
+    assert coastline_index(between, times) == pytest.approx(coastline_index(signal, times))
+
+
+def test_coastline_mistakes_in_the_call_raise_plain_value_errors():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    for bad_call, message in ((lambda: coastline_index(signal, times[:-1]), "same length"),
+                              (lambda: coastline_index(np.zeros((2, N)), times), "1-D"),
+                              (lambda: coastline_index(signal, times, t1=20, t2=3), "has to be before"),
+                              (lambda: coastline_index(signal, times[::-1]), "rise")):
+        with pytest.raises(ValueError, match=message) as caught:
+            bad_call()
+        assert not isinstance(caught.value, UnmeasurableWaveform) #a mistake, not a property of the waveform
+
+
+def test_coastline_accepts_plain_lists():
+    signal, times = hand_trace()
+    assert coastline_index(list(signal), list(times), t1=3, t2=7, noise_ms=4) == pytest.approx(8/3)
+
+
+def test_coastline_later_group_end_with_a_partly_filled_noise_window():
+    #her end time is the latest across signals, so it can run past this signal's own end. (27, 31] holds only 28 and
+    #29 ms here: values 0 and 2 -> one step of 2 -> mean 2 -> 8 - 4 x 2 = 0
+    signal, times = hand_trace()
+    assert coastline_index(signal, times, t1=3, t2=7, noise_ms=4, end_ms=31) == pytest.approx(0.0)
+
+
+def test_coastline_broken_time_axis_is_a_mistake_in_the_call():
+    times = time_axis_ms(N, FS)
+    signal = decaying_sine(times)
+    with_nan = times.copy()
+    with_nan[500] = np.nan #inside 3-20 ms: the step would jump across the hole
+    with_gap = np.delete(times, 500)
+    uneven = times.copy()
+    uneven[600:] += 0.5 * (times[1] - times[0])
+    for bad_times, bad_signal in ((with_nan, signal), (with_gap, np.delete(signal, 500)), (uneven, signal)):
+        with pytest.raises(ValueError, match="same step") as caught:
+            coastline_index(bad_signal, bad_times)
+        assert not isinstance(caught.value, UnmeasurableWaveform)
+
+
+def test_coastline_bad_noise_window_arguments_raise():
+    signal, times = hand_trace()
+    for kwargs in ({"noise_ms": 0}, {"noise_ms": -1}, {"noise_ms": np.nan}, {"noise_ms": np.inf}, {"end_ms": np.nan}):
+        with pytest.raises(ValueError, match="noise_ms has to be"):
+            coastline_index(signal, times, t1=3, t2=7, **kwargs)
+
+
+def test_coastline_a_window_with_fewer_than_2_samples_is_unmeasurable():
+    signal, times = hand_trace()
+    with pytest.raises(UnmeasurableWaveform, match="holds 1 samples"):
+        coastline_index(signal, times, t1=3, t2=3.5) #only the 3 ms sample

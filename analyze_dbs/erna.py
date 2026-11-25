@@ -361,3 +361,87 @@ def erna_measures(signal, times, fs, max_peaks=8):
     if row['n_peaks'] == 0:
         row["reason"] = "no ERNA: fewer than 2 extrema or the first is after 7 ms"
     return row
+
+
+def coastline_index(signal, times, t1=3, t2=20, noise_ms=7, end_ms=None):
+    """
+    Sarah's coastline burst index (incrementingExperiment_pull_wave_parameters.m:486-538, with
+    coastlineCumsumByGroup.m and coastlineSlopeByGroup.m): how much the signal moves up and down from t1 to t2 ms,
+    minus what noise alone would add over that many steps.
+        coastline index = sum of |step| over t1..t2  -  (number of steps) x (mean |step| over the noise window)
+    A step is the change from one sample to the next. Both windows are cut first and the steps taken inside them, so
+    no step crosses a window edge. The noise window is the last noise_ms of the epoch, (end_ms - noise_ms, end_ms].
+    Her "slope" is that mean step size, not a fitted line.
+    It uses the post-processed signal itself, not the 600 Hz low-passed one that the RMS and the peaks use.
+    The sum of steps is the total up-and-down distance, so for a steady wave it is about 4 x amplitude x frequency x
+    duration: one number for how much ERNA there is, with no peak-picking.
+    Method notes (hers, copied as they are):
+    - end_ms: she takes the latest time across every signal of that subject and condition, in all tables, not each
+      signal's own end. The caller has to work that out and pass it. Without it, this signal's last time is used.
+    - When the noise window holds fewer than 2 samples (e.g. end_ms is more than noise_ms past this signal's last
+      time), there is no step to average and the index is NaN, as in her code. NaN here carries no reason.
+    - The correction assumes noise adds its full mean step to every step. Where the signal is moving it adds less,
+      so the index is biased low, more so in noisier recordings (synthetic tests only, on the list for Walker with
+      the smoothing note). It is not clamped here. Her R code later sets negative values to 0.0001.
+    Stage 2: pass the epoch's real time axis. The default noise window (the last 7 ms) is a stage 1 choice. A short
+    BrainVision epoch would put it over the response or next to the next pulse's artifact, so stage 2 needs its own
+    noise window from its measure profile (still to decide).
+    Units: the signal's (volts from preprocess_dbs. Her tables are in mV, or z units for the z-scored signal).
+    Input:
+    signal: one post-processed channel (1-D), e.g. a row from postprocess_condition
+    times: the time of each sample in ms from time 0, rising, e.g. time_axis_ms(len(signal), fs)
+    t1, t2: the response window in ms, both ends included
+    noise_ms: the length of the noise window at the end of the epoch, in ms
+    end_ms: where the noise window ends, in ms (see above). None means times[-1]
+    Returns: the coastline index, one number (NaN when the noise window has fewer than 2 samples)
+    Raises UnmeasurableWaveform (a ValueError) when the waveform doesn't cover t1 to t2 (to within one sample), has
+    fewer than 2 samples in that window, or has a NaN or infinite value in either window. Raises a plain ValueError
+    for a mistake in the call: signal and times not 1-D or of different lengths, times with a NaN, a gap or uneven
+    steps, t1 not before t2, or noise_ms or end_ms not a finite number (noise_ms above 0).
+    Differences from her code: she would measure a trace that stops before t2 over whatever is there, and skip NaN
+    steps. Every condition she measured covers 3 to 20 ms, so this refuses instead of measuring a shorter stretch.
+    """
+    signal = np.asarray(signal, dtype=float)
+    times = np.asarray(times, dtype=float)
+    #fail loudly: mistakes in the call, not properties of the waveform
+    if signal.ndim != 1 or times.ndim != 1 or len(signal) != len(times):
+        raise ValueError(f"signal and times have to be 1-D and the same length. Got shapes {signal.shape} and "
+                         f"{times.shape}")
+    if not t1 < t2:
+        raise ValueError(f"the window start ({t1} ms) has to be before its end ({t2} ms)")
+    if not (np.isfinite(noise_ms) and noise_ms > 0) or (end_ms is not None and not np.isfinite(end_ms)):
+        raise ValueError(f"noise_ms has to be a finite number above 0 and end_ms finite (or None). Got {noise_ms} and "
+                         f"{end_ms}")
+    #a NaN or a gap in times would drop samples from a window and let a step jump across the hole
+    steps_ms = np.diff(times)
+    if (not np.all(np.isfinite(times)) or np.any(steps_ms <= 0)
+            or (len(steps_ms) > 0 and not np.allclose(steps_ms, steps_ms[0], rtol=1e-3, atol=0))):
+        raise ValueError("times has to rise by the same step from each sample to the next, with no gaps or NaN")
+    #fail loudly: a waveform that stops early would get a coastline over a shorter stretch without a word. One sample
+    #of slack, as in filtered_erna_window (less a sliver, so rounding error can't let a missing edge sample through)
+    slack_ms = (times[1] - times[0]) * (1 - 1e-6) if len(times) > 1 else 0
+    if len(times) < 2 or times[0] >= t1 + slack_ms or times[-1] <= t2 - slack_ms:
+        covers = "is too short" if len(times) < 2 else f"covers {times[0]:.3f} to {times[-1]:.3f} ms"
+        raise UnmeasurableWaveform(f"the signal {covers}, too short for the {t1} to {t2} ms coastline window")
+    mask = (times >= t1) & (times <= t2)
+    #fail loudly: a custom window holding 0 or 1 samples has no steps and would give 0 without a word
+    if np.count_nonzero(mask) < 2:
+        raise UnmeasurableWaveform(f"the {t1} to {t2} ms window holds {np.count_nonzero(mask)} samples, and a coastline "
+                                   f"needs at least 2")
+    step_sizes = np.abs(np.diff(signal[mask])) #each step's size, direction ignored
+    n_step_sizes = len(step_sizes) #one fewer than the samples in the window
+    step_sizes_sum = step_sizes.sum() #total up-and-down distance over the window
+    if end_ms is None:
+        end_ms = times[-1] #this signal's own end (her code uses the latest end across signals: pass it as end_ms)
+    #strict start, inclusive end, as in her code: a window exactly noise_ms long
+    noise_window = (times > end_ms - noise_ms) & (times <= end_ms)
+    #fail loudly: one NaN would make the index NaN with no reason given
+    if not (np.all(np.isfinite(signal[mask])) and np.all(np.isfinite(signal[noise_window]))):
+        raise UnmeasurableWaveform("the signal has NaN or infinite values inside the coastline or noise window")
+    #fewer than 2 samples: no step to average. NaN, as in her code, and without numpy's "mean of empty slice" warning
+    if np.count_nonzero(noise_window) < 2:
+        return np.nan
+    average_step_size_noise = np.mean(np.abs(np.diff(signal[noise_window])))
+    #what noise alone would add over this many steps comes off the total
+    coastline_idx = step_sizes_sum - n_step_sizes * average_step_size_noise
+    return coastline_idx
